@@ -1,0 +1,11 @@
+streamlit
+requests
+unstructured[pdf]
+pdf2image
+transformers
+torch
+fastapi
+pydantic
+chromadb
+uvicorn
+pipeline
