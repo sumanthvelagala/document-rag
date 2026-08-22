@@ -1,3 +1,13 @@
+---
+title: Document RAG
+emoji: 📄
+colorFrom: gray
+colorTo: gray
+sdk: gradio
+app_file: app.py
+pinned: false
+---
+
 # Document RAG — Hybrid Dense + BM25 Retrieval
 
 Upload any PDF and ask questions. Uses hybrid retrieval (dense + BM25 with Reciprocal Rank Fusion) for 91.7% Recall@10 across 60 benchmark questions spanning 15 papers and 6 domains.
