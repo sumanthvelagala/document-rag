@@ -1,11 +1,10 @@
 import streamlit as st
 import uuid
-import torch
+import numpy as np
 from io import BytesIO
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from cleaners import clean_text
 from chunking import sliding_window_chunks
 
@@ -16,13 +15,6 @@ RETRIEVE_K   = 50
 RRF_FINAL_K  = 10
 LLM_K        = 5
 RRF_K        = 60
-
-RAG_PROMPT = (
-    "You are a helpful assistant. Answer the question using ONLY the information "
-    "provided in the context below. If the answer is not in the context, say: "
-    "'The provided documents don't contain enough information to answer this.'\n\n"
-    "Context:\n{context}\n\nQuestion: {question}"
-)
 
 
 # ── session init ──────────────────────────────────────────────────────────────
@@ -41,12 +33,6 @@ if "session_id" not in st.session_state:
 def load_embedder():
     return SentenceTransformer("all-mpnet-base-v2")
 
-@st.cache_resource
-def load_llm():
-    name      = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-    tokenizer = AutoTokenizer.from_pretrained(name)
-    model     = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16)
-    return pipeline("text-generation", model=model, tokenizer=tokenizer), tokenizer
 
 
 # ── in-memory chromadb per session ────────────────────────────────────────────
@@ -143,26 +129,47 @@ def hybrid_search(query):
     return sorted(fused.values(), key=lambda x: x["score"], reverse=True)[:RRF_FINAL_K]
 
 
-# ── answer generation ─────────────────────────────────────────────────────────
+# ── answer generation — extractive with chunk-weighted scoring + semantic dedup
 def generate_answer(query, chunks):
-    llm_pipeline, tokenizer = load_llm()
+    embedder  = load_embedder()
+    n_chunks  = len(chunks)
 
-    context = ""
-    for c in chunks[:LLM_K]:
-        context += f"[{c['meta'].get('pdf_id', 'unknown')}]\n{c['doc']}\n\n"
+    sentences, sources, chunk_weights = [], [], []
+    for rank, c in enumerate(chunks):
+        w = 1.0 - (rank / n_chunks) * 0.3
+        for s in c["doc"].split("."):
+            s = s.strip()
+            if len(s) > 20:
+                sentences.append(s)
+                sources.append(c["meta"].get("pdf_id", "unknown"))
+                chunk_weights.append(w)
 
-    messages = [
-        {"role": "system", "content": (
-            "You are a helpful assistant. Answer using ONLY the provided context. "
-            "If the answer is not in the context, say so. Do not use outside knowledge."
-        )},
-        {"role": "user", "content": RAG_PROMPT.format(context=context, question=query)},
-    ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    if not sentences:
+        return "Not found in the document."
 
-    with st.spinner(":material/smart_toy: Generating answer..."):
-        result = llm_pipeline(prompt, max_new_tokens=400, do_sample=False)
-        return result[0]["generated_text"].split("<|assistant|>")[-1].strip()
+    q_emb      = embedder.encode(query, normalize_embeddings=True)
+    s_embs     = embedder.encode(sentences, normalize_embeddings=True)
+    sim_scores = s_embs @ q_emb
+
+    if float(sim_scores.max()) < 0.50:
+        return "Not found in the document."
+
+    scores = sim_scores * np.array(chunk_weights)
+
+    ranked = scores.argsort()[::-1]
+    selected, selected_embs = [], []
+    for idx in ranked:
+        if len(selected) >= 5:
+            break
+        emb = s_embs[idx]
+        if selected_embs:
+            sims = [float(emb @ se) for se in selected_embs]
+            if max(sims) > 0.90:
+                continue
+        selected.append((sentences[idx], sources[idx]))
+        selected_embs.append(emb)
+
+    return "\n".join(f"• {s} [{src}]" for s, src in selected)
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -224,12 +231,9 @@ with st.sidebar:
 # main — query
 st.header(":material/search: Ask a Question")
 query = st.text_input("Enter your question:", placeholder="e.g. What are the payment terms in the lease?")
+ask_clicked = st.button(":material/search: Ask", use_container_width=True, type="primary")
 
-col1, col2 = st.columns([1, 1])
-search_clicked   = col1.button(":material/search: Search chunks", use_container_width=True)
-generate_clicked = col2.button(":material/smart_toy: Generate answer", use_container_width=True)
-
-if (search_clicked or generate_clicked) and query:
+if ask_clicked and query:
     if not st.session_state.uploaded:
         st.warning("Upload at least one PDF first.")
     else:
@@ -239,11 +243,11 @@ if (search_clicked or generate_clicked) and query:
         if not chunks:
             st.error("No results found.")
         else:
-            if generate_clicked:
+            with st.spinner("Extracting answer..."):
                 answer = generate_answer(query, chunks)
-                st.subheader(":material/chat: Answer")
-                st.write(answer)
-                st.divider()
+            st.subheader(":material/chat: Answer")
+            st.write(answer)
+            st.divider()
 
             st.subheader(f":material/list: Top {len(chunks)} Retrieved Chunks")
             for i, result in enumerate(chunks, 1):

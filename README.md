@@ -34,8 +34,8 @@ flowchart TD
     DR --> RRF[RRF Fusion\nscore = 2·dense + 1·BM25]
     BR --> RRF
     RRF --> TOP[Top-10 Chunks]
-    TOP --> LLM[TinyLlama-1.1B-Chat\nZeroGPU local inference]
-    LLM --> ANS([Answer])
+    TOP --> EXT[Extractive QA\nsplit sentences · embed · top-3 with semantic dedup]
+    EXT --> ANS([Answer — verbatim sentences from document])
 ```
 
 > **Privacy:** PDFs are never stored on disk. Text is extracted server-side, chunked and embedded into RAM, then the original file is discarded. All session data (chunks, embeddings, BM25 index) lives in server memory and is wiped when the session ends.
@@ -46,7 +46,6 @@ flowchart TD
 sequenceDiagram
     participant B as Browser
     participant S as HF Spaces Server (RAM)
-    participant H as HF Inference API
 
     B->>S: Upload PDF bytes
     S->>S: pypdf extract → clean → chunk → embed
@@ -58,9 +57,8 @@ sequenceDiagram
     S->>S: Encode query (all-mpnet-base-v2)
     S->>S: Dense retrieval top-50 + BM25 top-50
     S->>S: RRF fusion → top-10 chunks
-    S->>H: top-10 chunks + question
-    H-->>S: Generated answer (TinyLlama-1.1B)
-    S-->>B: Answer + retrieved chunks
+    S->>S: Extractive QA — split chunks into sentences, embed, return top-3 by cosine sim with semantic dedup
+    S-->>B: Answer (verbatim sentences) + retrieved chunks
 ```
 
 ## Eval Results (60 questions, 15 papers, 6 domains)
@@ -83,11 +81,13 @@ sequenceDiagram
 | Weighted RRF (2:1) | dense 2x weight | 90% |
 | Universal chunker | remove title heuristic | **91.7%** |
 
-## Models
+## Models & Approach
 
-- **Embeddings**: `all-mpnet-base-v2` (sentence-transformers) — 768-dim, retrieval-optimized
-- **Generation**: `TinyLlama/TinyLlama-1.1B-Chat-v1.0` — runs locally on ZeroGPU
+- **Embeddings**: `all-mpnet-base-v2` (sentence-transformers) — 768-dim, retrieval-optimized, used for both retrieval and extractive QA
+- **Answer generation**: Extractive QA — no LLM. Split retrieved chunks into sentences, rank by cosine similarity to query, return top-3 with semantic deduplication (skip if cosine sim > 0.92 to already-selected). Verbatim sentences from the document, zero hallucination risk.
 - **Vector store**: ChromaDB (in-memory per session for frontend, persistent for eval pipeline)
+
+**Why not a generative LLM?** Tested TinyLlama-1.1B on 15 diverse questions: scored 5/15 (33%), including hallucinating inverted answers ("pets are allowed" when context says no) and confusing tenant vs landlord responsibilities. Chunk-weighted extractive QA scored 14/15 (93%) on the same eval with zero factual inversions.
 
 ## Setup
 

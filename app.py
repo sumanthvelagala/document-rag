@@ -1,13 +1,11 @@
 import os
 import uuid
 from io import BytesIO
-import torch
 import gradio as gr
 import spaces
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
-from transformers import AutoTokenizer, AutoModelForCausalLM
 from cleaners import clean_text
 from chunking import sliding_window_chunks
 
@@ -19,18 +17,9 @@ RRF_FINAL_K   = 10
 LLM_K         = 5
 RRF_K         = 60
 
-RAG_PROMPT = (
-    "You are a helpful assistant. Answer the question using ONLY the information "
-    "provided in the context below. If the answer is not in the context, say: "
-    "'The provided documents don't contain enough information to answer this.'\n\n"
-    "Context:\n{context}\n\nQuestion: {question}"
-)
-
 
 # ── cached globals (loaded once, shared across sessions) ──────────────────────
-_embedder  = None
-_llm_model = None
-_llm_tok   = None
+_embedder = None
 
 def get_embedder():
     global _embedder
@@ -38,24 +27,9 @@ def get_embedder():
         _embedder = SentenceTransformer("all-mpnet-base-v2")
     return _embedder
 
-def get_llm():
-    global _llm_model, _llm_tok
-    if _llm_model is None:
-        name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-        _llm_tok   = AutoTokenizer.from_pretrained(name)
-        _llm_model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16)
-    return _llm_model, _llm_tok
-
 @spaces.GPU
 def encode(texts):
     return get_embedder().encode(texts, normalize_embeddings=True)
-
-@spaces.GPU
-def generate_on_gpu(prompt):
-    model, tokenizer = get_llm()
-    inputs  = tokenizer(prompt, return_tensors="pt").to("cuda")
-    outputs = model.generate(**inputs, max_new_tokens=400, do_sample=False)
-    return tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
 
 # ── per-session state ─────────────────────────────────────────────────────────
@@ -145,23 +119,47 @@ def hybrid_search(query, state):
     return sorted(fused.values(), key=lambda x: x["score"], reverse=True)[:RRF_FINAL_K]
 
 
-# ── answer generation ─────────────────────────────────────────────────────────
+# ── answer generation — extractive with chunk-weighted scoring + semantic dedup
 def generate_answer(query, chunks):
-    _, tokenizer = get_llm()
+    import numpy as np
 
-    context = ""
-    for c in chunks[:LLM_K]:
-        context += f"[{c['meta'].get('pdf_id', 'unknown')}]\n{c['doc']}\n\n"
+    n_chunks = len(chunks)
+    sentences, sources, chunk_weights = [], [], []
+    for rank, c in enumerate(chunks):
+        w = 1.0 - (rank / n_chunks) * 0.3   # top chunk gets full weight, last gets 0.7x
+        for s in c["doc"].split("."):
+            s = s.strip()
+            if len(s) > 20:
+                sentences.append(s)
+                sources.append(c["meta"].get("pdf_id", "unknown"))
+                chunk_weights.append(w)
 
-    messages = [
-        {"role": "system", "content": (
-            "You are a helpful assistant. Answer using ONLY the provided context. "
-            "If the answer is not in the context, say so. Do not use outside knowledge."
-        )},
-        {"role": "user", "content": RAG_PROMPT.format(context=context, question=query)},
-    ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return generate_on_gpu(prompt)
+    if not sentences:
+        return "Not found in the document."
+
+    q_emb    = encode(query)
+    s_embs   = encode(sentences)
+    sim_scores = s_embs @ q_emb
+
+    if float(sim_scores.max()) < 0.50:
+        return "Not found in the document."
+
+    scores = sim_scores * np.array(chunk_weights)
+
+    ranked = scores.argsort()[::-1]
+    selected, selected_embs = [], []
+    for idx in ranked:
+        if len(selected) >= 5:
+            break
+        emb = s_embs[idx]
+        if selected_embs:
+            sims = [float(emb @ se) for se in selected_embs]
+            if max(sims) > 0.90:
+                continue
+        selected.append((sentences[idx], sources[idx]))
+        selected_embs.append(emb)
+
+    return "\n".join(f"• {s} [{src}]" for s, src in selected)
 
 
 # ── gradio event handlers ─────────────────────────────────────────────────────
@@ -179,19 +177,6 @@ def process_upload(files, state):
         msgs.append(msg)
 
     return state, "\n".join(msgs), _doc_list(state), _chunk_info(state)
-
-
-def search_chunks(query, state):
-    if state is None or not state["uploaded"]:
-        return "Upload at least one PDF first.", "", state
-    if not query.strip():
-        return "Enter a question.", "", state
-
-    chunks = hybrid_search(query, state)
-    if not chunks:
-        return "No results found.", "", state
-
-    return "", _format_chunks(chunks), state
 
 
 def search_and_generate(query, state):
@@ -268,9 +253,7 @@ with gr.Blocks(title="Document RAG") as demo:
                 label="Your question",
                 placeholder="e.g. What are the payment terms in the lease?",
             )
-            with gr.Row():
-                search_btn   = gr.Button("Search chunks", variant="secondary")
-                generate_btn = gr.Button("Generate answer", variant="primary")
+            ask_btn = gr.Button("Ask", variant="primary")
 
             answer_box = gr.Textbox(label="Answer", interactive=False, lines=6)
             chunks_box = gr.Markdown(label="Retrieved Chunks")
@@ -281,12 +264,12 @@ with gr.Blocks(title="Document RAG") as demo:
         inputs=[file_upload, state],
         outputs=[state, upload_status, doc_list, chunk_info],
     )
-    search_btn.click(
-        fn=search_chunks,
+    ask_btn.click(
+        fn=search_and_generate,
         inputs=[query, state],
         outputs=[answer_box, chunks_box, state],
     )
-    generate_btn.click(
+    query.submit(
         fn=search_and_generate,
         inputs=[query, state],
         outputs=[answer_box, chunks_box, state],
