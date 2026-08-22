@@ -86,19 +86,39 @@ def ingest_pdf(file_bytes, filename, state):
 
 
 # ── hybrid retrieval ──────────────────────────────────────────────────────────
-def hybrid_search(query, state):
+def hybrid_search(query, state, filter_pdfs=None):
     if not state["bm25_docs"]:
         return []
 
-    k         = min(RETRIEVE_K, len(state["bm25_docs"]))
-    q_emb     = encode(query)
-    results   = state["collection"].query(query_embeddings=[q_emb.tolist()], n_results=k)
+    # build active doc set — None or empty means search all
+    active = set(filter_pdfs) if filter_pdfs else None
+
+    # filter BM25 pool to active docs
+    if active:
+        bm25_pool = [(i, state["bm25_ids"][i])
+                     for i, m in enumerate(state["bm25_metas"])
+                     if m["pdf_id"] in active]
+    else:
+        bm25_pool = list(enumerate(state["bm25_ids"]))
+
+    k     = min(RETRIEVE_K, len(state["bm25_docs"]))
+    q_emb = encode(query)
+
+    # dense retrieval — filter via ChromaDB where clause
+    query_kwargs = dict(query_embeddings=[q_emb.tolist()], n_results=min(k, len(bm25_pool) or k))
+    if active:
+        query_kwargs["where"] = (
+            {"pdf_id": list(active)[0]} if len(active) == 1
+            else {"pdf_id": {"$in": list(active)}}
+        )
+    results     = state["collection"].query(**query_kwargs)
     dense_ids   = results["ids"][0]
     dense_docs  = results["documents"][0]
     dense_metas = results["metadatas"][0]
 
+    # BM25 retrieval over active pool only
     scores   = state["bm25"].get_scores(query.lower().split())
-    top_bm25 = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
+    top_bm25 = sorted(bm25_pool, key=lambda t: scores[t[0]], reverse=True)[:k]
 
     fused = {}
     for rank, (doc_id, doc, meta) in enumerate(zip(dense_ids, dense_docs, dense_metas)):
@@ -106,8 +126,7 @@ def hybrid_search(query, state):
             fused[doc_id] = {"score": 0.0, "doc": doc, "meta": meta}
         fused[doc_id]["score"] += 2.0 / (RRF_K + rank + 1)
 
-    for rank, idx in enumerate(top_bm25):
-        doc_id = state["bm25_ids"][idx]
+    for rank, (idx, doc_id) in enumerate(top_bm25):
         if doc_id not in fused:
             fused[doc_id] = {
                 "score": 0.0,
@@ -167,7 +186,7 @@ def process_upload(files, state):
     if state is None:
         state = init_session()
     if not files:
-        return state, "No files selected.", _doc_list(state), _chunk_info(state)
+        return state, "No files selected.", _doc_list(state), _chunk_info(state), gr.update()
 
     msgs = []
     for filepath in files:
@@ -176,16 +195,16 @@ def process_upload(files, state):
             state, msg = ingest_pdf(f.read(), filename, state)
         msgs.append(msg)
 
-    return state, "\n".join(msgs), _doc_list(state), _chunk_info(state)
+    return state, "\n".join(msgs), _doc_list(state), _chunk_info(state), gr.update(choices=state["uploaded"])
 
 
-def search_and_generate(query, state):
+def search_and_generate(query, filter_pdfs, state):
     if state is None or not state["uploaded"]:
         return "Upload at least one PDF first.", "", state
     if not query.strip():
         return "Enter a question.", "", state
 
-    chunks = hybrid_search(query, state)
+    chunks = hybrid_search(query, state, filter_pdfs or None)
     if not chunks:
         return "No results found.", "", state
 
@@ -195,7 +214,7 @@ def search_and_generate(query, state):
 
 def clear_session(state):
     state = init_session()
-    return state, "All documents cleared.", "No documents uploaded yet.", "0 / 5,000 chunks used"
+    return state, "All documents cleared.", "No documents uploaded yet.", "0 / 5,000 chunks used", gr.update(choices=[], value=[])
 
 
 def _doc_list(state):
@@ -253,6 +272,12 @@ with gr.Blocks(title="Document RAG") as demo:
                 label="Your question",
                 placeholder="e.g. What are the payment terms in the lease?",
             )
+            doc_filter = gr.Dropdown(
+                label="Search in (leave blank to search all documents)",
+                choices=[],
+                multiselect=True,
+                interactive=True,
+            )
             ask_btn = gr.Button("Ask", variant="primary")
 
             answer_box = gr.Textbox(label="Answer", interactive=False, lines=6)
@@ -262,22 +287,22 @@ with gr.Blocks(title="Document RAG") as demo:
     upload_btn.click(
         fn=process_upload,
         inputs=[file_upload, state],
-        outputs=[state, upload_status, doc_list, chunk_info],
+        outputs=[state, upload_status, doc_list, chunk_info, doc_filter],
     )
     ask_btn.click(
         fn=search_and_generate,
-        inputs=[query, state],
+        inputs=[query, doc_filter, state],
         outputs=[answer_box, chunks_box, state],
     )
     query.submit(
         fn=search_and_generate,
-        inputs=[query, state],
+        inputs=[query, doc_filter, state],
         outputs=[answer_box, chunks_box, state],
     )
     clear_btn.click(
         fn=clear_session,
         inputs=[state],
-        outputs=[state, upload_status, doc_list, chunk_info],
+        outputs=[state, upload_status, doc_list, chunk_info, doc_filter],
     )
 
 

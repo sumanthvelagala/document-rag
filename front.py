@@ -90,34 +90,45 @@ def ingest_pdf(file_bytes, filename):
 
 
 # ── hybrid retrieval ──────────────────────────────────────────────────────────
-def hybrid_search(query):
+def hybrid_search(query, filter_pdfs=None):
     if not st.session_state.bm25_docs:
         return []
 
     collection = get_collection()
     embedder   = load_embedder()
-    k          = min(RETRIEVE_K, len(st.session_state.bm25_docs))
+    active     = set(filter_pdfs) if filter_pdfs else None
 
-    # dense retrieval
-    q_emb   = embedder.encode(query, normalize_embeddings=True)
-    results = collection.query(query_embeddings=[q_emb.tolist()], n_results=k)
+    if active:
+        bm25_pool = [(i, st.session_state.bm25_ids[i])
+                     for i, m in enumerate(st.session_state.bm25_metas)
+                     if m["pdf_id"] in active]
+    else:
+        bm25_pool = list(enumerate(st.session_state.bm25_ids))
+
+    k     = min(RETRIEVE_K, len(st.session_state.bm25_docs))
+    q_emb = embedder.encode(query, normalize_embeddings=True)
+
+    query_kwargs = dict(query_embeddings=[q_emb.tolist()], n_results=min(k, len(bm25_pool) or k))
+    if active:
+        query_kwargs["where"] = (
+            {"pdf_id": list(active)[0]} if len(active) == 1
+            else {"pdf_id": {"$in": list(active)}}
+        )
+    results     = collection.query(**query_kwargs)
     dense_ids   = results["ids"][0]
     dense_docs  = results["documents"][0]
     dense_metas = results["metadatas"][0]
 
-    # bm25 retrieval
     scores   = st.session_state.bm25.get_scores(query.lower().split())
-    top_bm25 = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
+    top_bm25 = sorted(bm25_pool, key=lambda t: scores[t[0]], reverse=True)[:k]
 
-    # reciprocal rank fusion (dense weighted 2x)
     fused = {}
     for rank, (doc_id, doc, meta) in enumerate(zip(dense_ids, dense_docs, dense_metas)):
         if doc_id not in fused:
             fused[doc_id] = {"score": 0.0, "doc": doc, "meta": meta}
         fused[doc_id]["score"] += 2.0 / (RRF_K + rank + 1)
 
-    for rank, idx in enumerate(top_bm25):
-        doc_id = st.session_state.bm25_ids[idx]
+    for rank, (idx, doc_id) in enumerate(top_bm25):
         if doc_id not in fused:
             fused[doc_id] = {
                 "score": 0.0,
@@ -231,6 +242,11 @@ with st.sidebar:
 # main — query
 st.header(":material/search: Ask a Question")
 query = st.text_input("Enter your question:", placeholder="e.g. What are the payment terms in the lease?")
+
+filter_pdfs = st.multiselect(
+    "Search in (leave blank to search all documents):",
+    options=st.session_state.uploaded,
+)
 ask_clicked = st.button(":material/search: Ask", use_container_width=True, type="primary")
 
 if ask_clicked and query:
@@ -238,7 +254,7 @@ if ask_clicked and query:
         st.warning("Upload at least one PDF first.")
     else:
         with st.spinner("Retrieving relevant chunks..."):
-            chunks = hybrid_search(query)
+            chunks = hybrid_search(query, filter_pdfs or None)
 
         if not chunks:
             st.error("No results found.")
