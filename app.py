@@ -37,8 +37,9 @@ def get_embedder():
     return _embedder
 
 @spaces.GPU
-def encode(text):
-    return get_embedder().encode(text, normalize_embeddings=True)
+def encode(texts):
+    # accepts a single string or list — one GPU call per PDF/query
+    return get_embedder().encode(texts, normalize_embeddings=True)
 
 def get_llm():
     global _llm_client
@@ -85,8 +86,8 @@ def ingest_pdf(file_bytes, filename, state):
     if state["chunk_count"] + len(chunks) > MAX_CHUNKS:
         return state, f"{filename}: would exceed {MAX_CHUNKS:,} chunk limit."
 
-    for i, chunk in enumerate(chunks):
-        emb      = encode(chunk)
+    embeddings = encode(chunks)  # one GPU call for all chunks
+    for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
         chunk_id = f"{filename}_chunk{i}"
         state["collection"].add(
             ids=[chunk_id],
