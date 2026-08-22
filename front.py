@@ -1,11 +1,11 @@
-import os
 import streamlit as st
 import uuid
+import torch
 from io import BytesIO
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
-from huggingface_hub import InferenceClient
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from cleaners import clean_text
 from chunking import sliding_window_chunks
 
@@ -43,11 +43,10 @@ def load_embedder():
 
 @st.cache_resource
 def load_llm():
-    token = st.secrets.get("HF_TOKEN", os.environ.get("HF_TOKEN", ""))
-    return InferenceClient(
-        model="Qwen/Qwen2.5-7B-Instruct",
-        token=token or None,
-    )
+    name      = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    tokenizer = AutoTokenizer.from_pretrained(name)
+    model     = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16)
+    return pipeline("text-generation", model=model, tokenizer=tokenizer), tokenizer
 
 
 # ── in-memory chromadb per session ────────────────────────────────────────────
@@ -146,7 +145,7 @@ def hybrid_search(query):
 
 # ── answer generation ─────────────────────────────────────────────────────────
 def generate_answer(query, chunks):
-    client = load_llm()
+    llm_pipeline, tokenizer = load_llm()
 
     context = ""
     for c in chunks[:LLM_K]:
@@ -159,10 +158,11 @@ def generate_answer(query, chunks):
         )},
         {"role": "user", "content": RAG_PROMPT.format(context=context, question=query)},
     ]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
     with st.spinner(":material/smart_toy: Generating answer..."):
-        response = client.chat_completion(messages=messages, max_tokens=400)
-        return response.choices[0].message.content.strip()
+        result = llm_pipeline(prompt, max_new_tokens=400, do_sample=False)
+        return result[0]["generated_text"].split("<|assistant|>")[-1].strip()
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────

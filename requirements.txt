@@ -6,5 +6,7 @@ chromadb
 sentence-transformers
 rank-bm25
 pypdf
+transformers
+torch
 huggingface-hub
 requests

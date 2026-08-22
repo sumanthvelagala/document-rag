@@ -34,7 +34,7 @@ flowchart TD
     DR --> RRF[RRF Fusion\nscore = 2·dense + 1·BM25]
     BR --> RRF
     RRF --> TOP[Top-10 Chunks]
-    TOP --> LLM[Qwen2.5-7B-Instruct\nHF Inference API]
+    TOP --> LLM[TinyLlama-1.1B-Chat\nZeroGPU local inference]
     LLM --> ANS([Answer])
 ```
 
@@ -59,7 +59,7 @@ sequenceDiagram
     S->>S: Dense retrieval top-50 + BM25 top-50
     S->>S: RRF fusion → top-10 chunks
     S->>H: top-10 chunks + question
-    H-->>S: Generated answer (Qwen2.5-7B)
+    H-->>S: Generated answer (TinyLlama-1.1B)
     S-->>B: Answer + retrieved chunks
 ```
 
@@ -86,7 +86,7 @@ sequenceDiagram
 ## Models
 
 - **Embeddings**: `all-mpnet-base-v2` (sentence-transformers) — 768-dim, retrieval-optimized
-- **Generation**: `Qwen/Qwen2.5-7B-Instruct` via HF Inference API
+- **Generation**: `TinyLlama/TinyLlama-1.1B-Chat-v1.0` — runs locally on ZeroGPU
 - **Vector store**: ChromaDB (in-memory per session for frontend, persistent for eval pipeline)
 
 ## Setup

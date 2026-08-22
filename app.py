@@ -1,12 +1,13 @@
 import os
 import uuid
 from io import BytesIO
+import torch
 import gradio as gr
 import spaces
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
-from huggingface_hub import InferenceClient
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from cleaners import clean_text
 from chunking import sliding_window_chunks
 
@@ -27,8 +28,9 @@ RAG_PROMPT = (
 
 
 # ── cached globals (loaded once, shared across sessions) ──────────────────────
-_embedder   = None
-_llm_client = None
+_embedder  = None
+_llm_model = None
+_llm_tok   = None
 
 def get_embedder():
     global _embedder
@@ -36,21 +38,24 @@ def get_embedder():
         _embedder = SentenceTransformer("all-mpnet-base-v2")
     return _embedder
 
+def get_llm():
+    global _llm_model, _llm_tok
+    if _llm_model is None:
+        name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        _llm_tok   = AutoTokenizer.from_pretrained(name)
+        _llm_model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16)
+    return _llm_model, _llm_tok
+
 @spaces.GPU
 def encode(texts):
-    # accepts a single string or list — one GPU call per PDF/query
     return get_embedder().encode(texts, normalize_embeddings=True)
 
-def get_llm():
-    global _llm_client
-    if _llm_client is None:
-        token = os.environ.get("HF_TOKEN", "")
-        _llm_client = InferenceClient(
-            model="mistralai/Mistral-7B-Instruct-v0.1",
-            provider="hf-inference",
-            token=token or None,
-        )
-    return _llm_client
+@spaces.GPU
+def generate_on_gpu(prompt):
+    model, tokenizer = get_llm()
+    inputs  = tokenizer(prompt, return_tensors="pt").to("cuda")
+    outputs = model.generate(**inputs, max_new_tokens=400, do_sample=False)
+    return tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
 
 # ── per-session state ─────────────────────────────────────────────────────────
@@ -142,6 +147,8 @@ def hybrid_search(query, state):
 
 # ── answer generation ─────────────────────────────────────────────────────────
 def generate_answer(query, chunks):
+    _, tokenizer = get_llm()
+
     context = ""
     for c in chunks[:LLM_K]:
         context += f"[{c['meta'].get('pdf_id', 'unknown')}]\n{c['doc']}\n\n"
@@ -153,8 +160,8 @@ def generate_answer(query, chunks):
         )},
         {"role": "user", "content": RAG_PROMPT.format(context=context, question=query)},
     ]
-    response = get_llm().chat_completion(messages=messages, max_tokens=400)
-    return response.choices[0].message.content.strip()
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return generate_on_gpu(prompt)
 
 
 # ── gradio event handlers ─────────────────────────────────────────────────────
