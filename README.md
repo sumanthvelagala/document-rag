@@ -34,7 +34,7 @@ flowchart TD
     DR --> RRF[RRF Fusion\nscore = 2·dense + 1·BM25]
     BR --> RRF
     RRF --> TOP[Top-10 Chunks]
-    TOP --> EXT[Extractive QA\nsplit sentences · embed · top-3 with semantic dedup]
+    TOP --> EXT[Extractive QA\nsplit sentences · chunk-weighted scoring · top-5 with semantic dedup]
     EXT --> ANS([Answer — verbatim sentences from document])
 ```
 
@@ -57,7 +57,7 @@ sequenceDiagram
     S->>S: Encode query (all-mpnet-base-v2)
     S->>S: Dense retrieval top-50 + BM25 top-50
     S->>S: RRF fusion → top-10 chunks
-    S->>S: Extractive QA — split chunks into sentences, embed, return top-3 by cosine sim with semantic dedup
+    S->>S: Extractive QA — split into sentences, chunk-weighted cosine sim, top-5 with dedup + 0.50 min threshold
     S-->>B: Answer (verbatim sentences) + retrieved chunks
 ```
 
@@ -84,7 +84,7 @@ sequenceDiagram
 ## Models & Approach
 
 - **Embeddings**: `all-mpnet-base-v2` (sentence-transformers) — 768-dim, retrieval-optimized, used for both retrieval and extractive QA
-- **Answer generation**: Extractive QA — no LLM. Split retrieved chunks into sentences, rank by cosine similarity to query, return top-3 with semantic deduplication (skip if cosine sim > 0.92 to already-selected). Verbatim sentences from the document, zero hallucination risk.
+- **Answer generation**: Extractive QA — no LLM. Split top-10 retrieved chunks into sentences, score each as `cosine_sim(sentence, query) × chunk_rank_weight` (best chunk = 1.0×, worst = 0.7×), return top-5 with semantic dedup (skip if sim > 0.90 to already-selected). Returns "Not found in the document." if no sentence clears a 0.50 min similarity threshold. Verbatim sentences, zero hallucination risk.
 - **Vector store**: ChromaDB (in-memory per session for frontend, persistent for eval pipeline)
 
 **Why not a generative LLM?** Tested TinyLlama-1.1B on 15 diverse questions: scored 5/15 (33%), including hallucinating inverted answers ("pets are allowed" when context says no) and confusing tenant vs landlord responsibilities. Chunk-weighted extractive QA scored 14/15 (93%) on the same eval with zero factual inversions.
@@ -116,12 +116,11 @@ python eval.py
 
 | File | Purpose |
 |---|---|
-| `app.py` | Gradio app — HF Spaces deployment, per-session upload + hybrid search + generation |
+| `app.py` | Gradio app — HF Spaces deployment, per-session upload + hybrid search + extractive QA |
 | `front.py` | Streamlit app — local development and testing |
 | `main.py` | FastAPI backend — `/store` and `/query` endpoints |
 | `ingest.py` | Batch ingest papers into persistent ChromaDB for eval |
 | `eval.py` | Recall@10 evaluation: hybrid RRF vs BM25 baseline |
-| `eval_llm.py` | End-to-end eval: retrieval → generation → cosine similarity |
 | `embedding.py` | all-mpnet-base-v2 encode wrapper |
 | `chunking.py` | Universal sliding window chunker |
 | `cleaners.py` | PDF text cleaning (hyphen breaks, page numbers, whitespace) |
