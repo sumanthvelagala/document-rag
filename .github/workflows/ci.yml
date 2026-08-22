@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install pypdf rank-bm25
+
+      - name: Test chunking pipeline
+        run: |
+          python - <<'EOF'
+          from cleaners import clean_text
+          from chunking import sliding_window_chunks
+
+          sample = (
+              "This is a test document about retrieval augmented generation. "
+              "RAG systems combine dense retrieval with language model generation. "
+              "The retriever finds relevant chunks and the generator produces answers. "
+              "Hybrid approaches use both dense embeddings and BM25 keyword matching. "
+              "Reciprocal rank fusion combines scores from both retrievers efficiently. "
+          ) * 20
+
+          text   = clean_text(sample)
+          chunks = sliding_window_chunks(text, token_limit=128, overlap=32)
+
+          assert len(chunks) > 0, "No chunks produced"
+          assert all(len(c.split()) <= 128 for c in chunks), "Chunk exceeds token limit"
+
+          # verify overlap: consecutive chunks share words
+          w = text.split()
+          assert chunks[1].split()[:32] == w[96:128], "Overlap incorrect"
+
+          print(f"OK: {len(chunks)} chunks, overlap verified")
+          EOF
+
+      - name: Test BM25 scoring
+        run: |
+          python - <<'EOF'
+          from rank_bm25 import BM25Okapi
+          from cleaners import clean_text
+          from chunking import sliding_window_chunks
+
+          docs  = ["dense retrieval uses embeddings", "BM25 uses keyword frequency", "transformers use attention"]
+          bm25  = BM25Okapi([d.lower().split() for d in docs])
+          scores = bm25.get_scores("keyword retrieval".split())
+
+          assert scores[0] > scores[2], "BM25 scoring incorrect"
+          print(f"OK: BM25 scores {scores.tolist()}")
+          EOF

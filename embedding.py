@@ -1,21 +1,10 @@
-from transformers import AutoTokenizer, AutoModel
-import torch
+from sentence_transformers import SentenceTransformer
 
-
-tokenizer = AutoTokenizer.from_pretrained("allenai/scibert_scivocab_uncased")
-model = AutoModel.from_pretrained("allenai/scibert_scivocab_uncased")
-
-model.eval()
+model = SentenceTransformer("all-mpnet-base-v2")
 
 def tokenize(text):
+    return model.encode(text, normalize_embeddings=True)
 
-    inputs = tokenizer(text, return_tensors="pt", padding=True)
-
-    with torch.no_grad():
-        outputs = model(**inputs)
-        cls_embedding = outputs.last_hidden_state[:, 0, :]  
-    return cls_embedding.squeeze().numpy()
-    
 def embeddings(chunks):
     embedded_chunks = []
     for title, chunk in chunks:

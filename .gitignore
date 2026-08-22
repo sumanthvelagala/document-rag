@@ -3,9 +3,19 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Project-specific
+papers/
+test_docs/
+notes.md
+.cache/
+*.pt
+*.bin
+
 # C extensions
 *.so
 
+venv/
+__pycache__/
 *.pdf
 
 # Distribution / packaging

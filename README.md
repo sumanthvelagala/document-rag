@@ -1,48 +1,117 @@
-# RAG for Scientific Research
+# Document RAG — Hybrid Dense + BM25 Retrieval
 
-This project implements a Retrieval-Augmented Generation (RAG) system designed to answer scientific questions based on uploaded PDF documents. The system semantically chunks the PDF content and stores it in a vector database. When a query is submitted, it performs a semantic similarity search to retrieve the most relevant chunks. These retrieved chunks are then passed to a Large Language Model (LLM), which generates a concise and informative answer grounded in the retrieved context.
-- Accepts multiple PDF's
+Upload any PDF and ask questions. Uses hybrid retrieval (dense + BM25 with Reciprocal Rank Fusion) for 91.7% Recall@10 across 60 benchmark questions spanning 15 papers and 6 domains.
 
-When a PDF is uploaded, the system first processes the file by extracting its content and semantically chunking it into meaningful sections using pre-defined cleaning and chunking logic. These chunks are then embedded into vector representations using a tokenizer and stored in a Vector Database (Chroma/FAISS) for efficient similarity search.
+## Architecture
 
-Once stored, users can input a custom scientific question. The system uses semantic similarity to compare the query with all stored document embeddings and retrieves the top-k most relevant chunks. These retrieved chunks are compiled as context and sent to a Large Language Model (LLM) (via Hugging Face pipeline) along with the original question.
+```mermaid
+flowchart TD
+    A([PDF Upload]) --> B[pypdf\ntext extraction]
+    B --> C[clean_text\nfix hyphens · strip page numbers]
+    C --> D[Sliding Window Chunking\n128 words · 32 overlap]
+    D --> E[all-mpnet-base-v2\n768-dim embeddings]
+    D --> G[(BM25 Index)]
+    E --> F[(ChromaDB\nin-memory · per session)]
 
-The LLM generates an answer that is both grounded in the retrieved context and enriched with its own background knowledge. The final answer explicitly highlights which PDF(s) the information came from, making the response traceable and reliable.
+    Q([User Query]) --> QE[Encode Query\nall-mpnet-base-v2]
+    Q --> QB[Tokenize Query\nBM25]
 
-RAG model used for tokenization : allenai/scibert_scivocab_uncased
-LLM Used : TinyLlama/TinyLlama-1.1B-Chat-v1.0
-Database : ChromaDB
-API for DB: FastAPI
-FrontEnd: Streamlit
+    QE --> DR[Dense Retrieval\ntop-50 by cosine similarity]
+    QB --> BR[BM25 Retrieval\ntop-50 by keyword score]
+    F --> DR
+    G --> BR
 
--- pdf is read using unstructured.partition.pdf
+    DR --> RRF[RRF Fusion\nscore = 2·dense + 1·BM25]
+    BR --> RRF
+    RRF --> TOP[Top-10 Chunks]
+    TOP --> LLM[Mistral-7B-Instruct\nHF Inference API]
+    LLM --> ANS([Answer])
+```
 
-# Features
-Upload one or more scientific PDFs
-Semantic chunking based on content structure
-Cleaning logic to remove irrelevant headers, footers, or citations
-Chunk embedding and storage using a vector database
-semantic search over stored chunks
-Query answering using LLM with contextual awareness
-Chunk preview and section-based filtering for better interpretability
+> **Privacy:** PDFs are never stored on disk. Text is extracted server-side, chunked and embedded into RAM, then the original file is discarded. All session data (chunks, embeddings, BM25 index) lives in server memory and is wiped when the session ends.
 
+### Browser ↔ Server Flow
 
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant S as HF Spaces Server (RAM)
+    participant H as HF Inference API
 
-# Steps to download and use the project
-1.Create Virtual Environment and activate it
+    B->>S: Upload PDF bytes
+    S->>S: pypdf extract → clean → chunk → embed
+    S->>S: Store chunks in ChromaDB + BM25 index
+    S->>S: Discard original PDF
+    S-->>B: "X chunks added"
+
+    B->>S: Submit query
+    S->>S: Encode query (all-mpnet-base-v2)
+    S->>S: Dense retrieval top-50 + BM25 top-50
+    S->>S: RRF fusion → top-10 chunks
+    S->>H: top-10 chunks + question
+    H-->>S: Generated answer (Mistral-7B)
+    S-->>B: Answer + retrieved chunks
+```
+
+## Eval Results (60 questions, 15 papers, 6 domains)
+
+| Metric | Hybrid RRF | BM25 baseline |
+|---|---|---|
+| Recall@10 | **91.7% (55/60)** | 68.3% (41/60) |
+| Outperforms BM25 by | **+34%** | — |
+| Avg warm latency | **34ms** | <1ms |
+
+## Accuracy Journey
+
+| Step | Change | Accuracy |
+|---|---|---|
+| Baseline | SciBERT CLS embeddings | 0% |
+| Swap model | all-MiniLM-L6-v2 | 55% |
+| Better model | all-mpnet-base-v2 | 65% |
+| Smaller chunks | 200 → 128 tokens | 70% |
+| Hybrid RRF (1:1) | dense + BM25 fusion | 85% |
+| Weighted RRF (2:1) | dense 2x weight | 90% |
+| Universal chunker | remove title heuristic | **91.7%** |
+
+## Models
+
+- **Embeddings**: `all-mpnet-base-v2` (sentence-transformers) — 768-dim, retrieval-optimized
+- **Generation**: `mistralai/Mistral-7B-Instruct-v0.3` via HF Inference API
+- **Vector store**: ChromaDB (in-memory per session for frontend, persistent for eval pipeline)
+
+## Setup
+
+```bash
 python -m venv venv
 source venv/bin/activate
-
-2.Install Requirements
 pip install -r requirements.txt
+```
 
-3.Start API for DB
-uvicorn main:app --reload
+## Running
 
-4.Run Streamlit Front End
-Streamlit run front.py
+```bash
+# Gradio app (deployed on HF Spaces, or run locally)
+python app.py
 
+# Streamlit app (local development)
+streamlit run front.py
 
+# Eval pipeline (requires papers/ directory and FastAPI running)
+uvicorn main:app --host 127.0.0.1 --port 8000
+python ingest.py --fresh
+python eval.py
+```
 
--change the path to DataBase while using
--Change the Address of Database in front.py
+## Files
+
+| File | Purpose |
+|---|---|
+| `app.py` | Gradio app — HF Spaces deployment, per-session upload + hybrid search + generation |
+| `front.py` | Streamlit app — local development and testing |
+| `main.py` | FastAPI backend — `/store` and `/query` endpoints |
+| `ingest.py` | Batch ingest papers into persistent ChromaDB for eval |
+| `eval.py` | Recall@10 evaluation: hybrid RRF vs BM25 baseline |
+| `eval_llm.py` | End-to-end eval: retrieval → generation → cosine similarity |
+| `embedding.py` | all-mpnet-base-v2 encode wrapper |
+| `chunking.py` | Universal sliding window chunker |
+| `cleaners.py` | PDF text cleaning (hyphen breaks, page numbers, whitespace) |
