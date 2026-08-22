@@ -2,6 +2,7 @@ import os
 import uuid
 from io import BytesIO
 import gradio as gr
+import spaces
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
@@ -34,6 +35,10 @@ def get_embedder():
     if _embedder is None:
         _embedder = SentenceTransformer("all-mpnet-base-v2")
     return _embedder
+
+@spaces.GPU
+def encode(text):
+    return get_embedder().encode(text, normalize_embeddings=True)
 
 def get_llm():
     global _llm_client
@@ -80,9 +85,8 @@ def ingest_pdf(file_bytes, filename, state):
     if state["chunk_count"] + len(chunks) > MAX_CHUNKS:
         return state, f"{filename}: would exceed {MAX_CHUNKS:,} chunk limit."
 
-    emb_model = get_embedder()
     for i, chunk in enumerate(chunks):
-        emb      = emb_model.encode(chunk, normalize_embeddings=True)
+        emb      = encode(chunk)
         chunk_id = f"{filename}_chunk{i}"
         state["collection"].add(
             ids=[chunk_id],
@@ -106,7 +110,7 @@ def hybrid_search(query, state):
         return []
 
     k         = min(RETRIEVE_K, len(state["bm25_docs"]))
-    q_emb     = get_embedder().encode(query, normalize_embeddings=True)
+    q_emb     = encode(query)
     results   = state["collection"].query(query_embeddings=[q_emb.tolist()], n_results=k)
     dense_ids   = results["ids"][0]
     dense_docs  = results["documents"][0]
@@ -216,7 +220,7 @@ def _format_chunks(chunks):
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
-with gr.Blocks(title="Document RAG", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="Document RAG") as demo:
     state = gr.State(None)
 
     gr.Markdown(
