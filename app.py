@@ -46,7 +46,8 @@ def get_llm():
     if _llm_client is None:
         token = os.environ.get("HF_TOKEN", "")
         _llm_client = InferenceClient(
-            model="mistralai/Mistral-7B-Instruct-v0.3",
+            model="mistralai/Mistral-7B-Instruct-v0.1",
+            provider="hf-inference",
             token=token or None,
         )
     return _llm_client

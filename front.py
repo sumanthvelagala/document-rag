@@ -45,7 +45,7 @@ def load_embedder():
 def load_llm():
     token = st.secrets.get("HF_TOKEN", os.environ.get("HF_TOKEN", ""))
     return InferenceClient(
-        model="mistralai/Mistral-7B-Instruct-v0.3",
+        model="Qwen/Qwen2.5-7B-Instruct",
         token=token or None,
     )
 
