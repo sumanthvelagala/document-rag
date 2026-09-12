@@ -1,21 +1,28 @@
 import os
 import uuid
+import time
+import threading
 from io import BytesIO
 import gradio as gr
-import spaces
+import torch
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 from cleaners import clean_text
 from chunking import sliding_window_chunks
 
-MAX_CHUNKS    = 5000
-CHUNK_TOKENS  = 128
-CHUNK_OVERLAP = 32
-RETRIEVE_K    = 50
-RRF_FINAL_K   = 10
-LLM_K         = 5
-RRF_K         = 60
+torch.set_num_threads(1)
+
+MAX_CHUNKS          = 300
+MAX_PDFS            = 5
+CHUNK_TOKENS        = 128
+CHUNK_OVERLAP       = 32
+RETRIEVE_K          = 50
+RRF_FINAL_K         = 10
+LLM_K               = 5
+RRF_K               = 60
+SESSION_TTL         = 20 * 60   # 20 minutes idle → evict
+MAX_ACTIVE_SESSIONS = 300       # hard cap
 
 
 # ── cached globals (loaded once, shared across sessions) ──────────────────────
@@ -27,18 +34,57 @@ def get_embedder():
         _embedder = SentenceTransformer("all-mpnet-base-v2")
     return _embedder
 
-@spaces.GPU
 def encode(texts):
     return get_embedder().encode(texts, normalize_embeddings=True)
+
+
+# ── session registry + TTL cleanup ────────────────────────────────────────────
+_session_registry: dict = {}
+_registry_lock = threading.Lock()
+
+def _free_session_memory(state: dict):
+    try:
+        col = state.get("collection")
+        if col:
+            col.delete()
+    except Exception:
+        pass
+    state["bm25"]      = None
+    state["bm25_docs"] = []
+
+def _evict_session(sid: str):
+    with _registry_lock:
+        state = _session_registry.pop(sid, None)
+    if state:
+        _free_session_memory(state)
+
+def _cleanup_loop():
+    while True:
+        time.sleep(60)
+        now = time.time()
+        with _registry_lock:
+            stale = [sid for sid, s in _session_registry.items()
+                     if now - s.get("last_active", 0) > SESSION_TTL]
+        for sid in stale:
+            _evict_session(sid)
+
+threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 
 # ── per-session state ─────────────────────────────────────────────────────────
 def init_session():
     import chromadb
-    sid = str(uuid.uuid4())[:8]
+    with _registry_lock:
+        if len(_session_registry) >= MAX_ACTIVE_SESSIONS:
+            oldest = min(_session_registry,
+                         key=lambda s: _session_registry[s].get("last_active", 0))
+            _evict_session(oldest)
+
+    sid        = str(uuid.uuid4())[:8]
     client     = chromadb.Client()
     collection = client.create_collection(f"session_{sid}")
-    return {
+    state = {
+        "sid":         sid,
         "uploaded":    [],
         "chunk_count": 0,
         "bm25_docs":   [],
@@ -46,15 +92,20 @@ def init_session():
         "bm25_ids":    [],
         "bm25":        None,
         "collection":  collection,
+        "last_active": time.time(),
     }
+    with _registry_lock:
+        _session_registry[sid] = state
+    return state
 
 
 # ── pdf ingestion ─────────────────────────────────────────────────────────────
 def ingest_pdf(file_bytes, filename, state):
+    state["last_active"] = time.time()
     if filename in state["uploaded"]:
         return state, f"{filename}: already uploaded."
-    if len(state["uploaded"]) >= 30:
-        return state, "30 PDF limit reached."
+    if len(state["uploaded"]) >= MAX_PDFS:
+        return state, f"{MAX_PDFS} PDF limit reached."
 
     raw = ""
     for page in PdfReader(BytesIO(file_bytes)).pages:
@@ -66,7 +117,7 @@ def ingest_pdf(file_bytes, filename, state):
     if state["chunk_count"] + len(chunks) > MAX_CHUNKS:
         return state, f"{filename}: would exceed {MAX_CHUNKS:,} chunk limit."
 
-    embeddings = encode(chunks)  # one GPU call for all chunks
+    embeddings = encode(chunks)  # encode all chunks for this PDF
     for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
         chunk_id = f"{filename}_chunk{i}"
         state["collection"].add(
@@ -203,6 +254,7 @@ def search_and_generate(query, filter_pdfs, state):
         return "Upload at least one PDF first.", "", state
     if not query.strip():
         return "Enter a question.", "", state
+    state["last_active"] = time.time()
 
     chunks = hybrid_search(query, state, filter_pdfs or None)
     if not chunks:
@@ -213,8 +265,12 @@ def search_and_generate(query, filter_pdfs, state):
 
 
 def clear_session(state):
+    if state:
+        _free_session_memory(state)
+        with _registry_lock:
+            _session_registry.pop(state.get("sid", ""), None)
     state = init_session()
-    return state, "All documents cleared.", "No documents uploaded yet.", "0 / 5,000 chunks used", gr.update(choices=[], value=[])
+    return state, "All documents cleared.", "No documents uploaded yet.", f"0 / {MAX_CHUNKS:,} chunks used", gr.update(choices=[], value=[])
 
 
 def _doc_list(state):
@@ -246,7 +302,7 @@ with gr.Blocks(title="Document RAG") as demo:
         with gr.Column(scale=1):
             gr.Markdown("### Upload PDFs")
             file_upload = gr.File(
-                label="Select PDFs (max 30)",
+                label=f"Select PDFs (max {MAX_PDFS})",
                 file_types=[".pdf"],
                 file_count="multiple",
             )
@@ -254,7 +310,7 @@ with gr.Blocks(title="Document RAG") as demo:
             upload_status = gr.Textbox(label="Status", interactive=False)
             chunk_info    = gr.Textbox(
                 label="Chunks used",
-                value="0 / 5,000 chunks used",
+                value=f"0 / {MAX_CHUNKS:,} chunks used",
                 interactive=False,
             )
             doc_list = gr.Textbox(
@@ -305,6 +361,8 @@ with gr.Blocks(title="Document RAG") as demo:
         outputs=[state, upload_status, doc_list, chunk_info, doc_filter],
     )
 
+
+demo.queue(max_size=50, default_concurrency_limit=2)
 
 if __name__ == "__main__":
     demo.launch()
