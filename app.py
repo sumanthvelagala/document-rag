@@ -4,6 +4,7 @@ import time
 import threading
 from io import BytesIO
 import gradio as gr
+import spaces
 import torch
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
@@ -34,6 +35,7 @@ def get_embedder():
         _embedder = SentenceTransformer("all-mpnet-base-v2")
     return _embedder
 
+@spaces.GPU
 def encode(texts):
     return get_embedder().encode(texts, normalize_embeddings=True)
 
